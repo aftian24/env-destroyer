@@ -1,3 +1,4 @@
+import datetime
 import json
 import os
 import random
@@ -853,6 +854,32 @@ def main():
         )
 
         log_info(f"total_steps_per_epoch: {total_steps_per_epoch}")
+
+        # ── Time-aware epoch planning ─────────────────────────────────────────
+        # Adjusts num_train_epochs so the run uses the full wall-clock budget
+        # rather than stopping early when the preset epoch count finishes fast.
+        _use_deepspeed = getattr(training_args, "deepspeed", None) is not None
+        if not _use_deepspeed and total_steps_per_epoch > 0:
+            _now = datetime.datetime.now(datetime.timezone.utc)
+            _end_dt = datetime.datetime.strptime(
+                train_request["end_time"], "%Y-%m-%d %H:%M:%S"
+            ).replace(tzinfo=datetime.timezone.utc)
+            _remaining = (_end_dt - _now).total_seconds()
+            _param_nums = sum(p.numel() for p in model.parameters())
+            # Environment GRPO is slower than text GRPO due to env rollouts.
+            _est_step_time = 12.0 + _param_nums / 1e9 * 6.0
+            _achievable = int(_remaining * 0.80 / max(_est_step_time, 1.0))
+            if _achievable > 0:
+                _max_ep = 3.0
+                _opt_epochs = round(
+                    max(1.0, min(_max_ep, 1.2 * _achievable / total_steps_per_epoch)), 2
+                )
+                training_args.num_train_epochs = _opt_epochs
+                log_info(
+                    f"[env][clock] epochs adjusted to {_opt_epochs} "
+                    f"(remaining={_remaining:.0f}s, achievable={_achievable}, "
+                    f"steps/ep={total_steps_per_epoch})"
+                )
 
         periodic_save_steps = train_request.get("periodic_save_steps", -1)
         if periodic_save_steps > total_steps_per_epoch:

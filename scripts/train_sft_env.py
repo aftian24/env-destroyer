@@ -32,6 +32,7 @@ from customized_trainer import (
 from state_manager import get_state, set_state
 from tournament_env_utils import log_tournament_environment
 from utility import log_info
+from checkpoint_avg_callback import AdaptiveTrainingCallback
 
 LOCAL_RANK = int(os.getenv("LOCAL_RANK", "0"))
 
@@ -305,6 +306,23 @@ def main():
     if checking_step >= total_steps_per_epoch:
         checking_step = max(total_steps_per_epoch - 2, 1)
 
+    # ── Greedy-soup checkpoint averaging (Wortsman 2022) ─────────────────────
+    # Averages the N best checkpoints by validation loss instead of returning
+    # just the final or best-single checkpoint, improving OOD generalization.
+    _shard_ds = getattr(training_args, "deepspeed", None) is not None
+    _sharded = _shard_ds or len(training_args.fsdp) > 0
+    _trainable_bytes = sum(p.numel() for p in model.parameters() if p.requires_grad) * 2
+    _avg_mode = "disk" if (_sharded or 6 * _trainable_bytes > 100e9) else "ram"
+    _cm = train_request.get("checking_mode")
+    is_final_run = _cm in ("none", None)
+    ckpt_avg = (
+        AdaptiveTrainingCallback(window=3, averaging_mode=_avg_mode, output_dir=training_args.output_dir)
+        if is_final_run else None
+    )
+    if ckpt_avg is not None:
+        ckpt_avg._submission_dir = train_request["submission_dir"]
+        ckpt_avg.end_time = train_request["end_time"]
+
     trainer = SFTTrainer(
         model=model,
         args=training_args,
@@ -312,6 +330,7 @@ def main():
         eval_dataset=dev_ds,
         processing_class=tokenizer,
         callbacks=[
+            *([] if ckpt_avg is None else [ckpt_avg]),
             CustomEvalSaveCallback(
                 WhenToEvalHandler(
                     train_request["end_time"],
@@ -332,6 +351,8 @@ def main():
         ],
     )
 
+    if ckpt_avg is not None:
+        ckpt_avg.trainer = trainer
     trainer.train()
 
     if is_main_process(LOCAL_RANK):
