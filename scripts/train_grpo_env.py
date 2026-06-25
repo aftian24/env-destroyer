@@ -845,7 +845,6 @@ def main():
         # total_steps_per_epoch computed after resolution so values are correct.
         total_steps_per_epoch = (
             len(train_ds)
-            * training_args.num_generations
             // (
                 training_args.per_device_train_batch_size
                 * training_args.gradient_accumulation_steps
