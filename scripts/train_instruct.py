@@ -11,6 +11,7 @@ from transformers.trainer_utils import is_main_process
 from dataclasses import dataclass, field
 from transformers import Trainer
 from customized_trainer import resize_if_needed, set_generation_config, CustomEvalSaveCallback, WhenToEvalHandler, init_wandb
+from checkpoint_avg_callback import AdaptiveTrainingCallback
 
 # from packing.packed_dataset import PackedDataset
 from transformers import (
@@ -362,7 +363,25 @@ def main():
     checking_step = train_request["checking_step"]
     if checking_step >= total_steps_per_epoch:
         checking_step = total_steps_per_epoch - 2
-    
+
+    # ── Checkpoint averaging (ported from text-test) ──
+    _shard_ds = getattr(training_args, "deepspeed", None) is not None
+    _sharded = _shard_ds or len(training_args.fsdp) > 0
+    _trainable_bytes = sum(p.numel() for p in model.parameters() if p.requires_grad) * 2
+    _avg_mode = "disk" if (_sharded or 6 * _trainable_bytes > 100e9) else "ram"
+    log_info(f"[env][caldo] modo={_avg_mode} (treináveis={_trainable_bytes / 1e9:.0f}GB, sharded={_sharded})")
+    _cm = train_request.get("checking_mode")
+    is_final_run = _cm in ("none", None)
+    ckpt_avg = (
+        AdaptiveTrainingCallback(
+            window=3, averaging_mode=_avg_mode, output_dir=training_args.output_dir
+        )
+        if is_final_run else None
+    )
+    if ckpt_avg is not None:
+        ckpt_avg._submission_dir = train_request["submission_dir"]
+        ckpt_avg.end_time = train_request["end_time"]
+
     trainer = Trainer(
         model=model,
         tokenizer=tokenizer,
@@ -370,12 +389,13 @@ def main():
         train_dataset=train_ds,
         eval_dataset=dev_ds,
         callbacks=[
+            *([] if ckpt_avg is None else [ckpt_avg]),
             CustomEvalSaveCallback(
                 WhenToEvalHandler(train_request["end_time"], train_request["save_before_remaining_time"], periodic_save_steps=periodic_save_steps, steps_per_epoch=total_steps_per_epoch, max_steps=max_steps),
                 train_request["submission_dir"],
                 training_args.output_dir,
                 train_request["model_name"],
-                max_steps, 
+                max_steps,
                 checking_step=checking_step,
                 total_steps_all_epochs=total_steps_all_epochs,
                 end_time=train_request["end_time"],
@@ -384,9 +404,10 @@ def main():
         ],
     )
 
+    if ckpt_avg is not None:
+        ckpt_avg.trainer = trainer
+
     trainer.tokenizer = tokenizer
-    # last_checkpoint = get_last_checkpoint(training_args.output_dir)
-    # log_info(f"last_checkpoint: {last_checkpoint}")
     trainer.train()
     
     if is_main_process(LOCAL_RANK):
